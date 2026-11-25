@@ -1,0 +1,125 @@
+@startuml c2-to-be
+!include https://raw.githubusercontent.com/plantuml-stdlib/C4-PlantUML/master/C4_Container.puml
+
+LAYOUT_LANDSCAPE()
+LAYOUT_WITH_LEGEND()
+title GoFuture — C2 To-Be: доменные сервисы и переходный legacy-контур
+
+AddElementTag("legacy", $bgColor="#E6E6E6", $fontColor="#666666", $borderColor="#888888")
+AddElementTag("infra", $bgColor="#FFF2CC", $fontColor="#000000")
+AddElementTag("critical", $bgColor="#F8CECC", $fontColor="#000000")
+
+Person(passenger, "Пассажир", "Заказывает и отслеживает поездку")
+Person(driver_user, "Водитель", "Принимает заказ и передаёт телеметрию")
+Person(manager, "Корпоративный менеджер", "Управляет заказами и счетами")
+Person(operator, "Оператор", "Разбирает платежи и антифрод-кейсы")
+
+System_Ext(payment_provider, "Платёжные провайдеры", "Авторизация, списание и возвраты")
+System_Ext(map_provider, "Картографические провайдеры", "Геокодирование, маршрут и ETA")
+System_Ext(push_provider, "Push/SMS/e-mail провайдеры", "Доставка уведомлений")
+System_Ext(bank_api, "Банковский API", "Выплаты водителям")
+
+System_Boundary(clients, "Клиенты") {
+    Container(passenger_app, "Пассажирское приложение", "iOS/Android", "Заказ и отслеживание")
+    Container(driver_app, "Водительское приложение", "iOS/Android", "Заказы и телеметрия")
+    Container(corp_portal, "Корпоративный портал", "Web", "Заказы, счета, отчёты")
+}
+
+System_Boundary(platform, "GoFuture Platform") {
+    Container(gateway, "API Gateway", "Kong/HTTP", "Auth, rate limit, /v1, canary и Strangler Fig", $tags="infra")
+    Container(bff, "BFF слой", "FastAPI", "Адаптеры пассажира, водителя и корпоративного API")
+
+    System_Boundary(domains, "Доменные сервисы — database per service") {
+        Container(booking, "Booking Service", "FastAPI", "Заказ, состояния поездки, saga", $tags="critical")
+        ContainerDb(booking_db, "Booking DB", "PostgreSQL", "Trips, assignments, transitions")
+        Container(driver, "Driver Service", "FastAPI", "Профили, availability, matching", $tags="critical")
+        ContainerDb(driver_db, "Driver DB", "PostgreSQL", "Drivers, vehicles, status")
+        Container(pricing, "Pricing Service", "FastAPI", "Тарифы, quotes, surge")
+        ContainerDb(pricing_db, "Pricing DB", "PostgreSQL", "Rules, versions, quotes")
+        Container(payments, "Payments Service", "FastAPI", "Ledger, платежи, refunds, payouts", $tags="critical")
+        ContainerDb(payments_db, "Payments DB", "PostgreSQL", "Ledger, intents, idempotency")
+        Container(notification, "Notification Service", "FastAPI", "Шаблоны, предпочтения, delivery")
+        ContainerDb(notification_db, "Notification DB", "PostgreSQL", "Templates, devices, deliveries")
+        Container(geography, "Geography Service", "FastAPI + PostGIS", "Зоны, маршруты, ETA, geo-search")
+        ContainerDb(geography_db, "Geography DB", "PostgreSQL/PostGIS", "Zones, routes")
+        Container(fraud, "Fraud Service", "FastAPI", "Risk score, rules, cases")
+        ContainerDb(fraud_db, "Fraud DB", "PostgreSQL", "Assessments, rules, cases")
+        Container(analytics, "Analytics Service", "ETL/API", "Витрины, отчёты, экспорт")
+        ContainerDb(analytics_db, "Analytics DB", "ClickHouse", "Events and aggregates")
+    }
+
+    ContainerQueue(event_bus, "Event Bus", "RabbitMQ-compatible transition / target event bus", "Versioned domain events and outbox delivery", $tags="infra")
+    Container(cache, "Shared technical stores", "Redis + geo-index", "Cache, idempotency and driver search", $tags="infra")
+    Container(observability, "Observability", "Prometheus/Grafana/Loki/OTel", "Metrics, logs, traces, alerts", $tags="infra")
+    Container(acl, "Anti-Corruption Layer", "HTTP + event adapters", "Legacy DTO translation and temporary dual-write", $tags="legacy")
+
+    System_Boundary(legacy_boundary, "Legacy — temporary") {
+        Container(monolith, "GoFuture Monolith", "Django", "Unmigrated routes and fallback", $tags="legacy")
+        ContainerDb(monolith_db, "Monolith DB", "PostgreSQL", "Current shared data store", $tags="legacy")
+        ContainerQueue(celery, "RabbitMQ + Celery", "RabbitMQ/Celery", "Existing background jobs", $tags="legacy")
+    }
+}
+
+Rel(passenger, passenger_app, "Uses")
+Rel(driver_user, driver_app, "Uses")
+Rel(manager, corp_portal, "Uses")
+Rel(operator, gateway, "Admin API")
+Rel(passenger_app, gateway, "HTTPS /v1")
+Rel(driver_app, gateway, "HTTPS /v1")
+Rel(corp_portal, gateway, "HTTPS /v1")
+Rel(gateway, bff, "Routes and validates auth")
+Rel(gateway, monolith, "Fallback for unmigrated routes", "HTTP", $tags="legacy")
+
+Rel(bff, booking, "Orders/status")
+Rel(bff, pricing, "Quote preview")
+Rel(bff, driver, "Availability/telemetry")
+Rel(bff, payments, "Payment and balance")
+Rel(bff, analytics, "Reports")
+
+Rel(booking, pricing, "Quote", "sync")
+Rel(booking, geography, "Route/ETA", "sync")
+Rel(booking, driver, "Matching", "sync")
+Rel(booking, fraud, "Pre-check", "sync")
+Rel(driver, geography, "Driver zone", "sync")
+
+Rel(booking, booking_db, "Owns / SQL")
+Rel(driver, driver_db, "Owns / SQL")
+Rel(pricing, pricing_db, "Owns / SQL")
+Rel(payments, payments_db, "Owns / SQL")
+Rel(notification, notification_db, "Owns / SQL")
+Rel(geography, geography_db, "Owns / SQL")
+Rel(fraud, fraud_db, "Owns / SQL")
+Rel(analytics, analytics_db, "Owns / SQL")
+
+Rel(booking, event_bus, "trip.*; outbox")
+Rel(driver, event_bus, "driver.*; telemetry")
+Rel(pricing, event_bus, "pricing.*")
+Rel(payments, event_bus, "payment.*; outbox")
+Rel(notification, event_bus, "Consumes; delivery.*")
+Rel(geography, event_bus, "Geo projections")
+Rel(fraud, event_bus, "fraud.*")
+Rel(analytics, event_bus, "Consumes all domains")
+
+Rel(driver, cache, "Availability and geo index")
+Rel(geography, cache, "Geo cache")
+Rel(pricing, cache, "Quote cache")
+Rel(payments, cache, "Idempotency keys")
+
+Rel(payments, payment_provider, "Authorize/capture/refund", "HTTPS")
+Rel(payments, bank_api, "Payout", "HTTPS")
+Rel(geography, map_provider, "Route/ETA", "HTTPS")
+Rel(notification, push_provider, "Send", "HTTPS")
+
+Rel(acl, monolith, "Translate legacy DTO/events", "HTTP/AMQP", $tags="legacy")
+Rel(acl, booking, "Temporary compatibility path", "HTTP", $tags="legacy")
+Rel(acl, payments, "Temporary compatibility path", "HTTP", $tags="legacy")
+Rel(monolith, monolith_db, "Current ORM", "SQL", $tags="legacy")
+Rel(monolith, celery, "Legacy tasks", "AMQP", $tags="legacy")
+Rel(celery, event_bus, "Bridged events during migration", "AMQP", $tags="legacy")
+
+Rel(gateway, observability, "Metrics/logs/traces")
+Rel(domains, observability, "Metrics/logs/traces")
+Rel(event_bus, observability, "Queue/consumer metrics")
+
+SHOW_LEGEND()
+@enduml

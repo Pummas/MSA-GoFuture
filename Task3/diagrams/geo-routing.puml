@@ -1,0 +1,34 @@
+@startuml geo-routing
+!include https://raw.githubusercontent.com/plantuml-stdlib/C4-PlantUML/master/C4_Container.puml
+LAYOUT_LEFT_RIGHT()
+title GoFuture — Geo routing, affinity and fallback
+AddElementTag("task3", $bgColor="#FFE6E6", $fontColor="#000000", $borderColor="#FF0000")
+AddRelTag("task3", $lineColor="#FF0000", $textColor="#CC0000")
+Person(user, "Пользователь", "App/Web")
+Container(geo, "GeoDNS / Anycast", "30s TTL", "Latency routing; multi-point health quorum", $tags="task3")
+Container(edge, "Edge CDN + DDoS/WAF", "Anycast", "TLS, WAF, bot protection, rate limit", $tags="task3")
+Container(lb, "Regional LB/Gateway", "HTTPS/mTLS", "JWT, region_id, affinity", $tags="task3")
+System_Boundary(regions, "Healthy regional targets", $tags="task3") {
+  Container(sg, "Singapore", "AWS", "Nearest healthy region", $tags="task3")
+  Container(jk, "Jakarta", "AWS", "Nearest healthy region", $tags="task3")
+  Container(sp, "São Paulo", "AWS", "Nearest healthy region", $tags="task3")
+  Container(fr, "Frankfurt", "AWS", "Nearest healthy region", $tags="task3")
+}
+Container(affinity, "Affinity token", "Signed cookie/JWT", "Pinned to booking owner region", $tags="task3")
+Container(fallback, "Client fallback", "HTTPS retry", "Backoff and secondary endpoint", $tags="task3")
+Rel(user, geo, "HTTPS", $tags="task3")
+Rel(geo, edge, "nearest healthy answer", $tags="task3")
+Rel(edge, lb, "filtered request", $tags="task3")
+Rel(lb, sg, "region_id/affinity", $tags="task3")
+Rel(lb, jk, "region_id/affinity", $tags="task3")
+Rel(lb, sp, "region_id/affinity", $tags="task3")
+Rel(lb, fr, "region_id/affinity", $tags="task3")
+Rel(lb, affinity, "issue/validate", $tags="task3")
+Rel(user, fallback, "2 failures → retry", $tags="task3")
+Rel(fallback, geo, "fallback lookup", $tags="task3")
+Rel(geo, sg, "health checks", $tags="task3")
+Rel(geo, jk, "health checks", $tags="task3")
+Rel(geo, sp, "health checks", $tags="task3")
+Rel(geo, fr, "health checks", $tags="task3")
+SHOW_LEGEND()
+@enduml

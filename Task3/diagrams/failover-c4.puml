@@ -1,0 +1,44 @@
+@startuml failover-c4
+!include https://raw.githubusercontent.com/plantuml-stdlib/C4-PlantUML/master/C4_Container.puml
+LAYOUT_LANDSCAPE()
+LAYOUT_WITH_LEGEND()
+title GoFuture — C4 failover and recovery
+AddElementTag("failure", $bgColor="#FF0000", $fontColor="#FFFFFF", $borderColor="#990000")
+AddElementTag("task3", $bgColor="#FFE6E6", $fontColor="#000000", $borderColor="#FF0000")
+AddRelTag("task3", $lineColor="#FF0000", $textColor="#CC0000")
+Person(user, "Пользователь", "Заказ/статус")
+Container(edge, "GeoDNS/Anycast + WAF", "Edge", "Health-aware drain", $tags="task3")
+Container(fail, "Failure detector", "Probes + SLO", "AZ/region/DB/Kafka/DNS signals", $tags="failure")
+Container(lease, "Quorum lease + fencing", "Control plane", "owner_epoch, revoke writer", $tags="task3")
+Container(router, "Failover router", "GeoDNS/LB", "Canary and affinity switch", $tags="task3")
+System_Boundary(active, "Active region", $tags="task3") {
+  Container(app, "Domain services", "Booking/Driver/Payments/Saga", "Critical user path", $tags="task3")
+  ContainerDb(db, "PostgreSQL primary", "Multi-AZ", "Owned state", $tags="task3")
+  ContainerQueue(kafka, "Kafka regional cluster", "RF≥3", "Events/outbox", $tags="task3")
+}
+System_Boundary(dr, "Standby region", $tags="task3") {
+  Container(app2, "Warm domain services", "Same contracts", "Ready for promotion", $tags="task3")
+  ContainerDb(db2, "PostgreSQL replica", "Encrypted WAL/PITR", "Standby state", $tags="task3")
+  ContainerQueue(kafka2, "Kafka DR cluster", "Mirror/replay", "Permitted topics", $tags="task3")
+}
+Container(reconcile, "Reconciliation", "Ledger/CDC/PSP", "Idempotency, event replay, audit", $tags="task3")
+System_Ext(psp, "PSP", "Payment status source")
+Rel(user, edge, "HTTPS", $tags="task3")
+Rel(edge, router, "healthy target", $tags="task3")
+Rel(router, app, "normal traffic", $tags="task3")
+Rel(router, app2, "fallback/canary", $tags="task3")
+Rel(fail, lease, "quorum signal", $tags="task3")
+Rel(fail, edge, "drain", $tags="task3")
+Rel(lease, db, "fence old writer", $tags="task3")
+Rel(lease, db2, "promote new epoch", $tags="task3")
+Rel(app, db, "local writes", $tags="task3")
+Rel(app, kafka, "Outbox/CDC", $tags="task3")
+Rel(db, db2, "async WAL", $tags="task3")
+Rel(kafka, kafka2, "mirror/replay", $tags="task3")
+Rel(app2, db2, "promoted writes", $tags="task3")
+Rel(db2, reconcile, "WAL/checkpoint", $tags="task3")
+Rel(kafka2, reconcile, "event replay", $tags="task3")
+Rel(reconcile, psp, "verify payment status", $tags="task3")
+Rel(reconcile, app2, "resume Saga safely", $tags="task3")
+SHOW_LEGEND()
+@enduml

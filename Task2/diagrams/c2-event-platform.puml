@@ -1,0 +1,172 @@
+@startuml c2-event-platform
+!include https://raw.githubusercontent.com/plantuml-stdlib/C4-PlantUML/master/C4_Container.puml
+
+LAYOUT_LANDSCAPE()
+LAYOUT_WITH_LEGEND()
+title GoFuture — C2: событийная платформа, Saga и потоковая обработка
+
+AddElementTag("legacy", $bgColor="#E6E6E6", $fontColor="#666666", $borderColor="#888888")
+AddElementTag("infra", $bgColor="#FFF2CC", $fontColor="#000000")
+AddElementTag("critical", $bgColor="#F8CECC", $fontColor="#000000")
+AddElementTag("dlq", $bgColor="#F4CCCC", $fontColor="#990000", $borderColor="#990000")
+
+Person(passenger, "Пассажир", "Создаёт и отслеживает поездку")
+Person(driver_user, "Водитель", "Принимает заказ и передаёт телеметрию")
+Person(corporate_manager, "Корпоративный менеджер", "Создаёт корпоративные поездки и смотрит отчёты")
+Person(sre, "SRE инженер", "Разбирает алерты и потоки")
+
+System_Boundary(clients, "Клиенты") {
+    Container(passenger_app, "Пассажирское приложение", "iOS/Android", "Заказ и статус поездки")
+    Container(driver_app, "Водительское приложение", "iOS/Android", "Заказы и DriverLocationBatch")
+    Container(corporate_portal, "Корпоративный портал", "Web", "Корпоративные заказы, счета и отчёты")
+}
+
+System_Ext(psp, "Платёжный провайдер / PSP", "Авторизация, списание и возвраты")
+System_Ext(bank_api, "Банковский API", "Выплаты водителям")
+System_Ext(map_provider, "Картографический провайдер", "Геокодирование, маршруты и ETA")
+System_Ext(notification_providers, "Push/SMS/e-mail провайдеры", "Доставка уведомлений")
+
+System_Boundary(platform, "GoFuture Platform") {
+    Container(gateway, "API Gateway / BFF", "HTTP", "Auth, rate limit, совместимый API")
+
+    System_Boundary(domains, "Доменные сервисы — database per service") {
+        Container(booking, "Booking Service", "FastAPI", "Booking/Trip lifecycle; владелец Booking Saga", $tags="critical")
+        Container(driver, "Driver Service", "FastAPI", "Availability, matching, DriverLocationUpdated/Batch", $tags="critical")
+        Container(geography, "Geography Service", "FastAPI", "Геозоны, геокодирование, маршруты, ETA и geo-search")
+        Container(pricing, "Pricing Service", "FastAPI", "Quotes и surge")
+        Container(payments, "Payments Service", "FastAPI", "Ledger, authorization, capture, refund; Payment Saga", $tags="critical")
+        Container(fraud, "Fraud Service", "FastAPI", "Risk decision")
+        Container(notification, "Notification Service", "FastAPI", "Уведомления и delivery status")
+        Container(analytics, "Analytics Service", "ETL/API", "Проекции и витрины")
+        ContainerDb(geography_db, "Geography DB / geo-index", "PostgreSQL + PostGIS / search index", "Геозоны, маршруты, ETA и поисковая проекция")
+    }
+
+    System_Boundary(outbox, "Transactional Outbox / CDC") {
+        ContainerDb(outbox_db, "outbox_events", "PostgreSQL per service", "Бизнес-изменение и envelope в одной транзакции")
+        Container(debezium, "Debezium + Kafka Connect", "CDC", "WAL, Outbox Event Router, schema-aware publishing")
+    }
+
+    System_Boundary(kafka, "Kafka — региональный кластер по region_id") {
+        ContainerQueue(t_trip, "booking.trip.lifecycle.v1", "Kafka topic", "BookingCreated, TripStarted, TripCompleted; key=region_id:booking_id; retention 7d")
+        ContainerQueue(t_location, "driver.location.telemetry.v1", "Kafka topic", "DriverLocationUpdated/Batch; direct idempotent producer, at-least-once; key=region_id:tenant_id:driver_id; retention 24h")
+        ContainerQueue(t_payment, "payments.transaction.status.v1", "Kafka topic", "PaymentAuthorized/Captured/Refunded; key=region_id:payment_id; retention 30d")
+        ContainerQueue(t_geo, "geography.route.events.v1", "Kafka topic", "RouteCalculated, DriverRegionChanged; key=region_id:aggregate_id; retention 7d")
+        ContainerQueue(t_saga, "saga.booking.command.v1", "Kafka topic", "Saga commands/replies; key=saga_id; retention 7d")
+        ContainerQueue(t_other, "domain event topics", "Kafka topics", "pricing.*, fraud.*, notification.*, driver.*; versioned registry")
+        ContainerQueue(retry, "retry topics", "Kafka topics", "Bounded backoff and jitter", $tags="infra")
+        ContainerQueue(dlq, "{domain}.dlq.v1", "Kafka topic", "Poison messages, manual replay, retention 30d", $tags="dlq")
+        Container(schema, "Schema Registry", "Avro/JSON Schema", "Envelope compatibility и schema_version")
+    }
+
+    System_Boundary(flink, "Apache Flink — jobs per regional cluster") {
+        Container(f_geo, "Geo index job", "Flink", "Location windows → geo projection; group flink-geo")
+        Container(f_surge, "Surge job", "Flink", "Demand/supply windows → surge; group flink-surge")
+        Container(f_fraud, "Fraud features job", "Flink", "Streaming features; group flink-fraud")
+        Container(f_analytics, "Analytics job", "Flink", "Watermarks/checkpoints → realtime marts; group flink-analytics")
+    }
+
+    System_Boundary(saga, "Saga runtime") {
+        Container(orchestrator, "Saga Orchestrator", "State machine", "Booking/Payments commands, timeout, compensation")
+        ContainerDb(saga_db, "Saga State DB", "PostgreSQL", "saga_instances и saga_step_log")
+    }
+
+    System_Boundary(legacy, "Legacy — временно", $tags="legacy") {
+        Container(monolith, "GoFuture Monolith", "Django", "Немигрированные маршруты")
+        ContainerDb(monolith_db, "Monolith DB", "PostgreSQL", "Общая legacy БД; источник данных до миграции", $tags="legacy")
+        Container(acl, "Anti-Corruption Layer", "Adapter / CDC bridge", "Перевод legacy DTO/событий и временный dual-write", $tags="legacy")
+        ContainerQueue(rabbit, "RabbitMQ + Celery", "AMQP", "Только legacy background tasks", $tags="legacy")
+    }
+
+    System_Boundary(obs, "Observability") {
+        Container(otel, "OpenTelemetry Collector", "OTLP", "trace_id, metrics, logs")
+        Container(prom, "Prometheus", "TSDB", "Service/Kafka/Flink metrics and rules")
+        Container(grafana, "Grafana", "Dashboards", "Platform, streams, Saga, business KPI")
+        Container(loki, "Loki", "Logs", "Structured logs by trace_id/event_id")
+        Container(tempo, "Tempo", "Traces", "HTTP → Kafka → consumer/Flink")
+        Container(alertmanager, "Alertmanager", "Alerting", "DLQ, lag, Saga, CDC and SLO alerts")
+    }
+}
+
+Rel(passenger, passenger_app, "Использует")
+Rel(driver_user, driver_app, "Использует")
+Rel(corporate_manager, corporate_portal, "Использует")
+Rel(passenger_app, gateway, "REST/HTTPS")
+Rel(driver_app, gateway, "REST/HTTPS + telemetry")
+Rel(corporate_portal, gateway, "REST/HTTPS")
+Rel(gateway, booking, "Booking API")
+Rel(gateway, driver, "Driver API")
+Rel(gateway, geography, "Geography API")
+Rel(gateway, payments, "Payment API")
+
+Rel(booking, outbox_db, "business TX + event envelope", "SQL")
+Rel(driver, outbox_db, "business TX + event envelope", "SQL")
+Rel(payments, outbox_db, "business TX + event envelope", "SQL")
+Rel(geography, geography_db, "Geo data and projections", "SQL / geo-search")
+Rel(pricing, outbox_db, "business TX + event envelope", "SQL")
+Rel(outbox_db, debezium, "WAL / logical decoding")
+Rel(debezium, schema, "Validate schema_version")
+Rel(debezium, t_trip, "BookingCreated, TripStarted, TripCompleted")
+Rel(debezium, t_payment, "PaymentAuthorized, PaymentCaptured")
+Rel(driver, t_location, "DriverLocationUpdated/Batch; direct idempotent producer, at-least-once")
+Rel(geography, t_geo, "RouteCalculated, DriverRegionChanged")
+Rel(pricing, t_other, "QuoteCalculated, SurgeMultiplierUpdated")
+Rel(fraud, t_other, "FraudCheckCompleted")
+Rel(notification, t_other, "NotificationDelivered/Failed")
+
+Rel(booking, orchestrator, "Starts/advances Booking Saga")
+Rel(booking, geography, "Route/ETA and geo-zone query")
+Rel(driver, geography, "Geo-search and region lookup")
+Rel(orchestrator, saga_db, "State and step log", "SQL")
+Rel(orchestrator, t_saga, "ReserveDriver / AuthorizePayment / CapturePayment / compensate")
+Rel(t_saga, driver, "Commands/replies")
+Rel(t_saga, payments, "Commands/replies")
+Rel(t_saga, fraud, "Check command/reply")
+Rel(t_trip, notification, "Trip lifecycle")
+Rel(t_payment, notification, "Payment status")
+Rel(t_trip, analytics, "Read event stream")
+Rel(t_payment, analytics, "Read event stream")
+
+Rel(t_location, f_geo, "group flink-geo")
+Rel(t_location, f_surge, "group flink-surge")
+Rel(t_trip, f_surge, "demand windows")
+Rel(t_trip, f_fraud, "group flink-fraud")
+Rel(t_payment, f_fraud, "payment features")
+Rel(t_trip, f_analytics, "group flink-analytics")
+Rel(t_payment, f_analytics, "group flink-analytics")
+
+Rel(f_geo, driver, "Geo projection")
+Rel(f_geo, geography, "Geo index projection")
+Rel(t_geo, geography, "Geography events")
+Rel(f_surge, pricing, "Surge features")
+Rel(f_fraud, fraud, "Feature projection")
+Rel(f_analytics, analytics, "Realtime marts")
+
+Rel(monolith, rabbit, "Legacy Celery tasks", "AMQP", $tags="legacy")
+Rel(monolith, monolith_db, "Legacy reads/writes", "SQL", $tags="legacy")
+Rel(monolith, acl, "Legacy DTOs and migration events", "HTTP/CDC", $tags="legacy")
+Rel(acl, gateway, "Compatible API routing", "HTTP", $tags="legacy")
+Rel(acl, monolith_db, "Snapshot/CDC and dual-write", "SQL", $tags="legacy")
+Rel(monolith, outbox_db, "Temporary CDC/outbox bridge", "SQL", $tags="legacy")
+
+Rel(payments, psp, "Authorize/capture/refund", "HTTPS")
+Rel(payments, bank_api, "Payout instructions", "HTTPS")
+Rel(geography, map_provider, "Geocode/route/ETA", "HTTPS")
+Rel(notification, notification_providers, "Push/SMS/e-mail delivery", "HTTPS")
+
+Rel(booking, otel, "metrics/logs/traces", "OTLP")
+Rel(driver, otel, "metrics/logs/traces", "OTLP")
+Rel(payments, otel, "metrics/logs/traces", "OTLP")
+Rel(debezium, prom, "CDC lag/exporter")
+Rel(kafka, prom, "broker, producer, consumer lag")
+Rel(flink, prom, "checkpoint/backpressure reporter")
+Rel(otel, prom, "service metrics")
+Rel(otel, loki, "structured logs")
+Rel(otel, tempo, "distributed traces")
+Rel(prom, grafana, "PromQL")
+Rel(loki, grafana, "LogQL")
+Rel(tempo, grafana, "Trace lookup")
+Rel(prom, alertmanager, "Alert rules")
+Rel(alertmanager, sre, "Pager/Chat alerts")
+
+SHOW_LEGEND()
+@enduml

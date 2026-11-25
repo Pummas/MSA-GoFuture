@@ -1,0 +1,52 @@
+@startuml replication
+!include https://raw.githubusercontent.com/plantuml-stdlib/C4-PlantUML/master/C4_Container.puml
+LAYOUT_LANDSCAPE()
+title GoFuture — regional ownership and replication
+AddElementTag("task3", $bgColor="#FFE6E6", $fontColor="#000000", $borderColor="#FF0000")
+AddRelTag("task3", $lineColor="#FF0000", $textColor="#CC0000")
+System_Boundary(sg, "Singapore", $tags="task3") {
+  ContainerDb(sgdb, "PostgreSQL owner", "Multi-AZ", "Booking/Driver/Payments regional data", $tags="task3")
+  ContainerQueue(sgk, "Kafka SG", "RF≥3", "regional topics", $tags="task3")
+}
+System_Boundary(jk, "Jakarta", $tags="task3") {
+  ContainerDb(jkdb, "PostgreSQL owner", "Multi-AZ", "Booking/Driver/Payments regional data", $tags="task3")
+  ContainerQueue(jkk, "Kafka Jakarta", "RF≥3", "regional topics", $tags="task3")
+}
+System_Boundary(sp, "São Paulo", $tags="task3") {
+  ContainerDb(spdb, "PostgreSQL owner", "Multi-AZ", "Booking/Driver/Payments regional data", $tags="task3")
+  ContainerQueue(spk, "Kafka São Paulo", "RF≥3", "regional topics", $tags="task3")
+}
+System_Boundary(fr, "Frankfurt", $tags="task3") {
+  ContainerDb(frdb, "PostgreSQL owner", "Multi-AZ", "Booking/Driver/Payments regional data", $tags="task3")
+  ContainerQueue(frk, "Kafka Frankfurt", "RF≥3", "regional topics", $tags="task3")
+}
+Container(outbox, "Transactional Outbox + CDC", "Debezium/WAL", "Business TX then event", $tags="task3")
+Container(fence, "Fencing controller", "Quorum lease/epoch", "Promotion and split-brain protection", $tags="task3")
+Container(standby, "Standby replicas", "Encrypted WAL/PITR", "Active-standby for Payments/Saga", $tags="task3")
+Container(analytics, "Analytics/Flink", "Append-only", "Regional projections, replay, backups", $tags="task3")
+Rel(sgdb, outbox, "commit → CDC", $tags="task3")
+Rel(jkdb, outbox, "commit → CDC", $tags="task3")
+Rel(spdb, outbox, "commit → CDC", $tags="task3")
+Rel(frdb, outbox, "commit → CDC", $tags="task3")
+Rel(outbox, sgk, "region_id events", $tags="task3")
+Rel(outbox, jkk, "region_id events", $tags="task3")
+Rel(outbox, spk, "region_id events", $tags="task3")
+Rel(outbox, frk, "region_id events", $tags="task3")
+Rel(sgk, jkk, "Mirror permitted topics", $tags="task3")
+Rel(jkk, sgk, "Mirror permitted topics", $tags="task3")
+Rel(spk, frk, "Mirror permitted topics", $tags="task3")
+Rel(frk, spk, "Mirror permitted topics", $tags="task3")
+Rel(sgdb, standby, "Async WAL/PITR", $tags="task3")
+Rel(jkdb, standby, "Async WAL/PITR", $tags="task3")
+Rel(spdb, standby, "Async WAL/PITR", $tags="task3")
+Rel(frdb, standby, "Async WAL/PITR", $tags="task3")
+Rel(fence, sgdb, "owner_epoch / promote", $tags="task3")
+Rel(fence, jkdb, "owner_epoch / promote", $tags="task3")
+Rel(fence, spdb, "owner_epoch / promote", $tags="task3")
+Rel(fence, frdb, "owner_epoch / promote", $tags="task3")
+Rel(sgk, analytics, "replay/aggregate", $tags="task3")
+Rel(jkk, analytics, "replay/aggregate", $tags="task3")
+Rel(spk, analytics, "replay/aggregate", $tags="task3")
+Rel(frk, analytics, "replay/aggregate", $tags="task3")
+SHOW_LEGEND()
+@enduml
