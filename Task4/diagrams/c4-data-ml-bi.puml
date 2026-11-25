@@ -1,0 +1,72 @@
+@startuml c4-data-ml-bi
+!include https://raw.githubusercontent.com/plantuml-stdlib/C4-PlantUML/master/C4_Container.puml
+
+LAYOUT_LANDSCAPE()
+LAYOUT_WITH_LEGEND()
+title GoFuture — C4: regional data, ML and BI pipeline
+
+AddElementTag("regional", $bgColor="#E8F1FF", $fontColor="#000000", $borderColor="#4472C4")
+AddElementTag("global", $bgColor="#E8F5E9", $fontColor="#000000", $borderColor="#2E7D32")
+AddElementTag("quality", $bgColor="#FFF2CC", $fontColor="#000000", $borderColor="#BF9000")
+AddElementTag("ml", $bgColor="#F4E6FF", $fontColor="#000000", $borderColor="#7030A0")
+
+Person(data_team, "Команда данных и ML", "Обучает модели и владеет контрактами")
+Person(sre, "SRE / data owner", "Следит за SLO и качеством")
+
+System_Boundary(regional, "Regional data plane — Singapore / Jakarta / São Paulo / Frankfurt") {
+    Container(domains, "Доменные сервисы Task1", "Booking, Driver, Pricing, Payments, Notification, Geography, Fraud, Analytics", "Публикуют факты через outbox; source of truth остаётся у домена", $tags="regional")
+    ContainerQueue(kafka, "Regional Kafka clusters", "Kafka; Task2 topics", "Versioned topics, event envelope, region_id, surge events, replay; RF≥3", $tags="regional")
+    Container(schema, "Schema Registry", "Avro/JSON Schema", "Compatibility, schema_version и Data Contracts", $tags="quality")
+    Container(ingestion, "Regional ingestion + validation", "Kafka Connect/Debezium + Flink", "Envelope, range, dedup, watermark; CDC PostgreSQL только для backfill/migration", $tags="quality")
+    Container(pseudo, "Regional pseudonymization", "Policy/KMS/HMAC", "Удаляет PII и готовит разрешённый cross-region dataset", $tags="regional")
+    ContainerDb(lake_regional, "Regional Iceberg Lake", "S3-compatible object storage", "Bronze raw PII, Silver normalized, regional Gold; retention/replay", $tags="regional")
+    Container(flink, "Regional Flink jobs", "Apache Flink", "Demand/surge, fraud features, geo and realtime marts; checkpoint/watermark", $tags="regional")
+    Container(redis, "Online Feature Store", "Feast + Redis per region", "Low-latency pricing/fraud features; materialized by region", $tags="ml")
+    Container(pricing, "Pricing Service", "Task1 domain", "Consumes approved surge/model output; fallback to rules", $tags="regional")
+    Container(fraud, "Fraud Service", "Task1 domain", "Consumes score; rules/hold fallback", $tags="regional")
+}
+
+System_Boundary(global, "Global analytical contour — pseudonymized/aggregated only") {
+    ContainerDb(lake_global, "Global Iceberg Lake", "S3-compatible object storage", "Silver/Gold pseudonymized facts; time travel and backfill", $tags="global")
+    Container(spark, "Batch processing", "Apache Spark", "Training snapshots, compaction, historical backfill", $tags="global")
+    Container(feast_offline, "Offline Feature Store", "Feast over Iceberg", "Feature views and point-in-time joins", $tags="ml")
+    Container(airflow, "ML orchestration", "Apache Airflow", "Quality gates, training, evaluation and promotion", $tags="ml")
+    ContainerDb(mlflow, "Model Registry", "MLflow", "Experiments, artifacts, versions and lineage", $tags="ml")
+    Container(kserve, "Model serving", "KServe", "Regional endpoints, canary and versioned inference", $tags="ml")
+    Container(evidently, "Model/data monitoring", "Evidently", "Drift, skew, quality and rollback gates", $tags="quality")
+    ContainerDb(clickhouse, "BI analytical store", "ClickHouse", "Regional and global marts; no OLTP access", $tags="global")
+    Container(datalens, "BI", "DataLens", "Regional and global dashboards", $tags="global")
+}
+
+Rel(data_team, airflow, "Defines runs and approves models")
+Rel(sre, evidently, "Receives SLO/drift alerts")
+Rel(domains, kafka, "Task2 outbox events; region_id")
+Rel(domains, ingestion, "Own DB CDC for snapshot/backfill only")
+Rel(kafka, schema, "Validate envelope/schema_version")
+Rel(schema, ingestion, "Compatible contract")
+Rel(kafka, ingestion, "Topics: booking.*, driver.*, pricing.*, payments.*, fraud.*, notification.*, geography.*")
+Rel(ingestion, lake_regional, "Validated → Bronze")
+Rel(ingestion, pseudo, "Permitted records")
+Rel(pseudo, lake_regional, "Pseudonymized Silver/Gold")
+Rel(kafka, flink, "Streaming groups; surge events")
+Rel(flink, lake_regional, "Realtime Silver/Gold")
+Rel(flink, redis, "Materialize online features")
+Rel(redis, pricing, "Pricing features / surge")
+Rel(redis, fraud, "Fraud features")
+Rel(flink, pricing, "pricing.surge.updates.v1")
+Rel(lake_regional, lake_global, "Aggregates/pseudonyms only; residency boundary")
+Rel(lake_global, spark, "Iceberg snapshots / replay")
+Rel(spark, feast_offline, "Point-in-time feature views")
+Rel(lake_global, clickhouse, "Gold facts and aggregates")
+Rel(feast_offline, airflow, "Training dataset")
+Rel(airflow, spark, "Batch training/backfill")
+Rel(airflow, mlflow, "Register evaluated model")
+Rel(mlflow, kserve, "Approved model version")
+Rel(kserve, pricing, "Regional pricing inference")
+Rel(kserve, fraud, "Regional fraud score")
+Rel(kserve, evidently, "Prediction/serving metrics")
+Rel(lake_global, evidently, "Data drift baseline")
+Rel(clickhouse, datalens, "SQL regional/global marts")
+
+SHOW_LEGEND()
+@enduml

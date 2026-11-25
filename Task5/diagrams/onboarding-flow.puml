@@ -1,0 +1,95 @@
+@startuml onboarding-flow
+title GoFuture — Tenant onboarding and lifecycle saga
+
+actor "Partner / Tenant Owner" as partner
+participant "Partner Portal" as portal
+participant "Tenant Provisioning Service\n(TPS Saga)" as tps
+participant "Verification / Compliance" as verify
+database "Tenant Registry" as registry
+participant "Regional Provisioner\nDB/RLS/schema/namespace" as data
+participant "Keycloak\nOIDC/SAML + MFA" as iam
+participant "Quota & Configuration" as config
+participant "Monitoring / Sandbox" as monitor
+participant "Task1 domains + Kafka" as platform
+participant "OPA / Audit" as policy
+
+== Application ==
+partner -> portal: Submit partner profile, region and tier
+portal -> tps: Create idempotent provisioning_id
+tps -> registry: Create tenant_id, status=onboarding
+tps -> verify: Verify documents, domain, region and plan
+verify --> tps: Approved / rejected
+alt rejected
+    tps -> registry: status=suspended; reason + audit
+    tps --> portal: Request rejected / remediation
+    portal --> partner: Show rejection and next steps
+else approved
+    tps -> registry: Store region_id, tier and policy set
+
+    == Data provisioning ==
+    tps -> data: Provision tier in owner region
+    data -> data: Starter: shared schema + RLS\nStandard: schema-per-tenant\nEnterprise: DB/namespace/KMS
+    data --> tps: Data plane ready + health check
+
+    == IAM and policy ==
+    tps -> iam: Create tenant group, roles, client and SSO metadata
+    iam --> tps: OIDC/SAML federation + MFA ready
+    tps -> policy: Publish RBAC/ABAC tenant_id/region_scope policy
+    policy --> tps: Policy compiled and deny-by-default check
+
+    == Quotas and platform configuration ==
+    tps -> config: Apply Kong rate limits, Kafka ACL/quotas, retention and flags
+    config -> platform: Create tenant routes, ACLs and consumer isolation
+    platform --> config: Config acknowledged
+    config --> tps: Configuration ready
+
+    == Monitoring and sandbox ==
+    tps -> monitor: Create dashboards, alerts, audit sink and sandbox
+    monitor -> platform: Synthetic API/event/RLS/region-fence journey
+    platform --> monitor: Checks passed
+    monitor --> tps: Monitoring ready
+
+    == Activation ==
+    tps -> registry: status=active, activation timestamp
+    tps -> platform: Publish TenantActivated\n{tenant_id, region_id, schema_version}
+    tps --> portal: Active endpoint, SSO metadata and limits
+    portal --> partner: Tenant active
+end
+
+== Compensation on failure ==
+group Any step fails / timeout
+    tps -> tps: Retry idempotently with timeout/backoff
+    alt retries exhausted
+        tps -> iam: Revoke clients, sessions and grants
+        tps -> config: Remove ACLs, quotas, routes and flags
+        tps -> data: Stop/delete temporary provisioning\n(or retain quarantined Enterprise data by policy)
+        tps -> monitor: Remove sandbox; preserve diagnostic audit
+        tps -> registry: status=suspended/failed; compensation record
+        tps --> portal: Incident/reference; manual recovery required
+    else transient error
+        tps -> tps: Resume saga from durable step state
+    end
+end
+
+== Lifecycle ==
+partner -> portal: Suspend / export / deprovision request
+portal -> tps: Authorized lifecycle command
+alt suspend
+    tps -> registry: status=suspended
+    tps -> iam: Block login/new sessions
+    tps -> platform: Block new writes; retain controlled read/recovery
+else deprovision
+    tps -> registry: status=deprovisioning
+    tps -> platform: Freeze writes; export domain data/events
+    tps -> monitor: Export audit and manifests/checksums
+    tps -> data: Delete tier resources after retention/legal hold
+    tps -> iam: Revoke users, service accounts and federation
+    tps -> registry: status=deprovisioned + audit tombstone
+end
+
+legend right
+  Every command carries provisioning_id, tenant_id and region_id.
+  JWT, DB context, Kafka envelope and audit are validated at each boundary.
+  Cross-region promotion follows Task3 owner_epoch/fencing.
+endlegend
+@enduml

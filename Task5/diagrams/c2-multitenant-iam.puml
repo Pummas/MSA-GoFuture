@@ -1,0 +1,91 @@
+@startuml c2-multitenant-iam
+!include https://raw.githubusercontent.com/plantuml-stdlib/C4-PlantUML/master/C4_Container.puml
+
+LAYOUT_LANDSCAPE()
+LAYOUT_WITH_LEGEND()
+title GoFuture — C2: multitenant isolation, IAM and regional data plane
+
+AddElementTag("security", $bgColor="#F4CCCC", $fontColor="#000000", $borderColor="#990000")
+AddElementTag("regional", $bgColor="#E8F1FF", $fontColor="#000000", $borderColor="#4472C4")
+AddElementTag("tenant", $bgColor="#E8F5E9", $fontColor="#000000", $borderColor="#2E7D32")
+AddElementTag("infra", $bgColor="#FFF2CC", $fontColor="#000000", $borderColor="#BF9000")
+
+Person(partner, "Партнёр / Tenant Owner", "Заявка, SSO и управление tenant")
+Person(corporate_user, "Corporate Client User", "Поездки и отчёты в своём tenant")
+Person(driver_user, "Водитель", "Назначение и телеметрия")
+Person(operator, "Operations / Support", "Операционная работа и поддержка")
+Person(sre, "SRE / Security Auditor", "Инциденты, аудит и SLO")
+
+System_Boundary(clients, "Client and partner access") {
+    Container(partner_portal, "Partner Portal", "Web", "Заявка, onboarding status, tenant administration")
+    Container(corp_portal, "Corporate / Driver Clients", "Web + mobile", "Tenant-scoped API journeys")
+}
+
+System_Boundary(control_plane, "GoFuture Multitenant Control Plane") {
+    Container(gateway, "API Gateway / Kong", "Kong/HTTPS", "JWT validation, tenant/region context, WAF, rate limits and quotas", $tags="security,infra")
+    Container(keycloak, "Keycloak", "OIDC/SAML", "SSO federation, MFA, roles, sessions and service identities", $tags="security")
+    Container(opa, "OPA Policy Engine", "Rego/ABAC", "RBAC + tenant_id/region_scope/resource authorization", $tags="security")
+    Container(registry, "Tenant Registry", "PostgreSQL", "tenant_id, tier, region_id, lifecycle and policy metadata", $tags="tenant")
+    Container(provisioning, "Tenant Provisioning Service", "Saga orchestrator", "Verification, provisioning, IAM, quota, sandbox and compensation", $tags="tenant")
+    Container(config, "Configuration and Quotas", "Kong/Kafka/feature flags", "Tenant limits, ACLs, retention and noisy-neighbor controls", $tags="infra")
+}
+
+System_Boundary(data_plane, "Regional data planes — Task3 owner regions") {
+    Container(domains, "Task1 Domain Services", "Booking, Driver, Pricing, Payments, Notification, Geography, Fraud, Analytics", "Tenant-aware APIs; database per service; no Payouts/Billing/Identity service", $tags="regional")
+    ContainerQueue(kafka, "Regional Kafka", "Kafka + Schema Registry", "Task2 versioned topics; mandatory tenant_id + region_id; quotas, ACL and consumer isolation", $tags="regional")
+    System_Boundary(isolation, "Tenant isolation tiers in each regional service") {
+        ContainerDb(starter, "Starter data plane", "PostgreSQL shared schema + RLS", "tenant_id columns, deny-by-default RLS")
+        ContainerDb(standard, "Standard data plane", "PostgreSQL schema-per-tenant", "schema ACL and isolated connection pools")
+        ContainerDb(enterprise, "Enterprise data plane", "Dedicated DB/namespace + regional KMS", "Dedicated network, DB, key and backup boundary")
+    }
+    Container(datalake, "Regional Data Lake / BI", "Iceberg Bronze/Silver/Gold + ClickHouse", "Task4 tenant partitions; raw residency; pseudonymized global views", $tags="regional")
+}
+
+System_Boundary(observability, "Observability") {
+    Container(otel, "OpenTelemetry", "OTLP", "tenant_id/region_id/trace_id propagation and redaction", $tags="infra")
+    Container(prom, "Prometheus", "Metrics", "per-tenant quotas, latency, errors, saturation and Kafka lag", $tags="infra")
+    Container(grafana, "Grafana", "Dashboards", "per-tenant, regional and platform SLO dashboards", $tags="infra")
+    Container(loki, "Loki", "Logs", "structured audit/diagnostic logs", $tags="infra")
+    Container(tempo, "Tempo", "Traces", "Gateway → service → Kafka → Data Lake traces", $tags="infra")
+    Container(alertmanager, "Alertmanager", "Alerting", "noisy neighbor, SLO, provisioning and security alerts", $tags="infra")
+}
+
+Rel(partner, partner_portal, "Submits tenant request")
+Rel(corporate_user, corp_portal, "Uses tenant workspace")
+Rel(driver_user, corp_portal, "Uses driver app")
+Rel(operator, gateway, "Tenant-scoped operations")
+Rel(sre, grafana, "Monitors and audits")
+Rel(partner_portal, provisioning, "Application / status")
+Rel(corp_portal, gateway, "HTTPS + JWT")
+Rel(partner_portal, gateway, "HTTPS + JWT")
+Rel(gateway, keycloak, "OIDC/SAML login, JWKS, MFA")
+Rel(gateway, opa, "Authorize subject + tenant + region")
+Rel(gateway, registry, "Resolve tenant policy/region")
+Rel(provisioning, registry, "Saga state and lifecycle")
+Rel(provisioning, keycloak, "Create groups, clients, federation")
+Rel(provisioning, isolation, "Provision tier / RLS / schema / DB")
+Rel(provisioning, config, "ACL, quotas, config and sandbox")
+Rel(gateway, domains, "Routes with validated tenant_id/region_id")
+Rel(domains, opa, "Object authorization / policy decision")
+Rel(domains, starter, "Starter: RLS transaction context")
+Rel(domains, standard, "Standard: tenant schema")
+Rel(domains, enterprise, "Enterprise: dedicated DB/namespace/KMS")
+Rel(domains, kafka, "Outbox events: tenant_id + region_id")
+Rel(kafka, domains, "ACL-isolated consumer groups")
+Rel(kafka, datalake, "Validated topic ingestion")
+Rel(datalake, domains, "Approved aggregates/features")
+Rel(domains, otel, "Metrics/logs/traces")
+Rel(gateway, otel, "Access traces and audit")
+Rel(kafka, otel, "Producer/consumer lag and ACL metrics")
+Rel(datalake, otel, "Freshness, access and residency metrics")
+Rel(otel, prom, "Metrics")
+Rel(otel, loki, "Structured logs")
+Rel(otel, tempo, "Distributed traces")
+Rel(prom, grafana, "PromQL dashboards")
+Rel(loki, grafana, "LogQL dashboards")
+Rel(tempo, grafana, "Trace lookup")
+Rel(prom, alertmanager, "SLO/quota rules")
+Rel(alertmanager, sre, "Pager / incident")
+
+SHOW_LEGEND()
+@enduml
